@@ -391,6 +391,13 @@ async def join_by_link(client: TelegramClient, link: str):
                 log(tag, f"Joined private chat (target): {chat_id}")
         except UserAlreadyParticipantError:
             log(tag, "Already participant (private).")
+            # Try to get entity via link and register it
+            try:
+                entity = await client.get_entity(link)
+                register_target_chat(client, entity.id)
+                log(tag, f"Already participant, registered private chat: {entity.id}")
+            except Exception as e2:
+                log(tag, f"Failed to get entity for already-participant private: {e2}")
         except Exception as e:
             log(tag, f"Failed to join by private invite: {e}")
         return
