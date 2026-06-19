@@ -67,6 +67,8 @@ STATE_WAIT_MESSAGE_REMOVE = "WAIT_MESSAGE_REMOVE"
 STATE_WAIT_TIMER_VALUE = "WAIT_TIMER_VALUE"
 STATE_WAIT_SPECIAL_ADD = "WAIT_SPECIAL_ADD"
 STATE_WAIT_SPECIAL_REMOVE = "WAIT_SPECIAL_REMOVE"
+# وضعیت جدید برای افزودن گروه دستی
+STATE_WAIT_GROUP_ADD = "WAIT_GROUP_ADD"
 
 TELEGRAM_LINK_REGEX = re.compile(r"(https?://t\.me/[^\s]+)")
 
@@ -323,6 +325,22 @@ async def remove_account_by_index(owner_id: int, idx: int):
         log(f"SYSTEM/{owner_id}", f"Account {cfg.phone} disconnected & removed.")
 
 
+# تابع جدید برای افزودن گروه دستی به تمام اکانت‌ها
+async def add_manual_group(owner_id: int, link: str):
+    profile = get_profile(owner_id)
+    if not profile.user_clients:
+        raise Exception("هیچ اکانتی لاگین نشده است.")
+
+    success_count = 0
+    for client in profile.user_clients.values():
+        try:
+            await join_by_link(client, link)
+            success_count += 1
+        except Exception as e:
+            log(f"{owner_id}", f"Error joining group for one client: {e}")
+    return success_count
+
+
 async def send_loop_for_client(client: TelegramClient, phone: str, owner_id: int):
     profile = get_profile(owner_id)
     me = await client.get_me()
@@ -440,6 +458,8 @@ def main_menu_buttons(owner: bool):
         [Button.inline("💬 مدیریت پیام‌ها", b"menu_messages")],
         [Button.inline("⏱ تنظیم تایمر", b"menu_timer")],
         [Button.inline("🚀 کنترل ارسال پیام‌ها", b"menu_sending")],
+        # دکمه جدید برای افزودن گروه دستی
+        [Button.inline("➕ افزودن گروه دستی", b"group_add")],
     ]
     if owner:
         rows.append([Button.inline("👑 مدیریت کاربران ویژه", b"menu_special")])
@@ -685,6 +705,17 @@ async def bot_callback(event: events.CallbackQuery.Event):
         await stop_sending_process(event)
         return
 
+    # افزودن گروه دستی
+    if data == "group_add":
+        set_state(uid, STATE_WAIT_GROUP_ADD)
+        await event.edit(
+            "➕ لینک گروهی که می‌خواهید به لیست هدف اضافه شود را بفرستید:\n"
+            "مثال: https://t.me/joinchat/ABCDEF یا https://t.me/mygroup",
+            buttons=main_menu_buttons(owner_flag),
+            parse_mode="Markdown"
+        )
+        return
+
     if data == "menu_special":
         if not owner_flag:
             await event.answer("فقط مالک ربات می‌تواند کاربران ویژه را مدیریت کند.", alert=True)
@@ -890,6 +921,20 @@ async def bot_text_handler(event: events.NewMessage.Event):
             await event.respond("منوی تایمر:", buttons=timer_menu_buttons())
         except Exception:
             await event.respond("عدد معتبر (دقیقه مثبت) وارد کن.")
+        return
+
+    # مدیریت افزودن گروه دستی
+    if state == STATE_WAIT_GROUP_ADD:
+        try:
+            count = await add_manual_group(uid, text)
+            set_state(uid, STATE_NONE)
+            await event.respond(
+                f"✅ گروه با موفقیت به لیست هدف برای {count} اکانت اضافه شد.\n"
+                "همه اکانت‌ها به گروه ملحق شده و در لیست هدف قرار گرفتند.",
+                buttons=main_menu_buttons(is_owner(uid))
+            )
+        except Exception as e:
+            await event.respond(f"❌ خطا در افزودن گروه:\n{e}", buttons=main_menu_buttons(is_owner(uid)))
         return
 
     if state == STATE_WAIT_SPECIAL_ADD and is_owner(uid):
