@@ -13,6 +13,7 @@ from telethon import TelegramClient, events, Button
 from telethon.errors import UserAlreadyParticipantError, SessionPasswordNeededError
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
+from telethon.tl.functions.account import UpdateProfileRequest  # NEW
 from telethon.sessions import StringSession
 
 # ---------- Environment ----------
@@ -295,6 +296,7 @@ STATE_WAIT_TIMER_VALUE = "WAIT_TIMER_VALUE"
 STATE_WAIT_SPECIAL_ADD = "WAIT_SPECIAL_ADD"
 STATE_WAIT_SPECIAL_REMOVE = "WAIT_SPECIAL_REMOVE"
 STATE_WAIT_GROUP_ADD = "WAIT_GROUP_ADD"
+STATE_WAIT_BIO = "WAIT_BIO"  # NEW
 
 TELEGRAM_LINK_REGEX = re.compile(r"(https?://t\.me/[^\s]+)")
 
@@ -704,6 +706,38 @@ async def stop_sending_process(event):
     await event.edit("⏹ همه‌ی فرآیندهای ارسال پیام متوقف شدند.",
                      buttons=sending_menu_buttons(is_owner(owner_id)))
 
+# ---------- NEW: Set Bio for all accounts ----------
+async def set_bio_for_all_accounts(owner_id: int, bio_text: str) -> str:
+    """Set the given bio text for all active accounts of this owner.
+       Returns a summary message."""
+    profile = get_profile(owner_id)
+    if not profile.user_clients:
+        return "❌ هیچ اکانت فعالی برای تغییر بیوگرافی وجود ندارد."
+
+    success = []
+    failed = []
+
+    for phone, client in profile.user_clients.items():
+        try:
+            # Ensure client is authorized
+            if not await client.is_user_authorized():
+                failed.append(f"{phone} (not authorized)")
+                continue
+
+            # Update profile bio using account.UpdateProfileRequest
+            await client(UpdateProfileRequest(about=bio_text))
+            success.append(phone)
+            log(f"{owner_id}/{phone}", f"Bio updated to: {bio_text[:30]}...")
+        except Exception as e:
+            failed.append(f"{phone} ({str(e)})")
+
+    summary = f"✅ بیوگرافی برای {len(success)} اکانت تنظیم شد.\n"
+    if failed:
+        summary += f"❌ {len(failed)} اکانت با خطا مواجه شد:\n" + "\n".join(failed)
+    else:
+        summary += "همه اکانت‌ها با موفقیت به‌روزرسانی شدند."
+    return summary
+
 # ---------- Bot Menus ----------
 bot_client = TelegramClient("bot_session", API_ID, API_HASH)
 
@@ -725,6 +759,7 @@ def accounts_menu_buttons():
         [Button.inline("➕ افزودن اکانت جدید", b"acc_add")],
         [Button.inline("📜 لیست اکانت‌ها", b"acc_list")],
         [Button.inline("🗑 حذف اکانت", b"acc_remove")],
+        [Button.inline("📝 تنظیم بیوگرافی", b"acc_set_bio")],  # NEW
         [Button.inline("⬅️ بازگشت", b"back_main")],
     ]
 
@@ -841,6 +876,20 @@ async def bot_callback(event: events.CallbackQuery.Event):
         for i, cfg in enumerate(profile.accounts, start=1):
             lines.append(f"{i}) {cfg.phone}")
         await event.edit("\n".join(lines), buttons=accounts_menu_buttons())
+        return
+
+    # NEW: Set bio
+    if data == "acc_set_bio":
+        if not profile.user_clients:
+            await event.edit("❌ هیچ اکانت فعالی برای تنظیم بیوگرافی وجود ندارد.", buttons=accounts_menu_buttons())
+            return
+        set_state(uid, STATE_WAIT_BIO)
+        await event.edit(
+            "📝 لطفاً بیوگرافی جدیدی که می‌خواهید برای **همه** اکانت‌ها تنظیم شود را وارد کنید.\n"
+            "حداکثر ۷۰ کاراکتر (Telegram limit).",
+            buttons=accounts_menu_buttons(),
+            parse_mode="Markdown"
+        )
         return
 
     if data == "menu_channels":
@@ -1190,6 +1239,16 @@ async def bot_text_handler(event: events.NewMessage.Event):
             )
         except Exception as e:
             await event.respond(f"❌ خطا در افزودن گروه:\n{e}", buttons=main_menu_buttons(is_owner(uid)))
+        return
+
+    # NEW: Set bio handler
+    if state == STATE_WAIT_BIO:
+        if len(text) > 70:
+            await event.respond("⚠️ بیوگرافی نباید بیشتر از ۷۰ کاراکتر باشد. لطفاً کوتاه‌تر وارد کنید.")
+            return
+        set_state(uid, STATE_NONE)
+        summary = await set_bio_for_all_accounts(uid, text)
+        await event.respond(summary, buttons=accounts_menu_buttons())
         return
 
     if state == STATE_WAIT_SPECIAL_ADD and is_owner(uid):
