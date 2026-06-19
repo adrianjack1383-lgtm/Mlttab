@@ -96,16 +96,18 @@ async def save_profile(owner_id: int, profile_data: 'ProfileData'):
         await session.execute(AccountModel.__table__.delete().where(AccountModel.owner_id == owner_id))
         for acc in profile_data.accounts:
             client = profile_data.user_clients.get(acc.phone)
-            session_str = ""
+            session_str = acc.session_string or ""
             if client:
-                session_str = client.session.save() if hasattr(client.session, 'save') else client.session.string
+                extracted = extract_session_string(client)
+                if extracted:
+                    session_str = extracted
             session.add(AccountModel(
                 owner_id=owner_id,
                 phone=acc.phone,
                 api_id=acc.api_id,
                 api_hash=acc.api_hash,
                 password=acc.password,
-                session_string=session_str
+                session_string=session_str or ""
             ))
 
         # Source channels
@@ -156,7 +158,8 @@ async def load_profile(owner_id: int) -> Optional['ProfileData']:
                 api_id=acc_model.api_id,
                 api_hash=acc_model.api_hash,
                 phone=acc_model.phone,
-                password=acc_model.password
+                password=acc_model.password,
+                session_string=acc_model.session_string or ""
             )
             pd.accounts.append(cfg)
 
@@ -255,6 +258,7 @@ class AccountConfig:
     api_hash: str
     phone: str
     password: Optional[str] = None
+    session_string: str = ""
 
 @dataclass
 class ProfileData:
@@ -296,6 +300,33 @@ TELEGRAM_LINK_REGEX = re.compile(r"(https?://t\.me/[^\s]+)")
 
 def log(prefix: str, msg: str):
     print(f"[{prefix}] {msg}")
+
+
+def extract_session_string(client: TelegramClient) -> str:
+    """Return a Telegram string session for persistence.
+
+    Telethon's SQLite session object does not always expose a string via
+    `session.save()`, so we try the recommended StringSession conversion first
+    and fall back to other available methods.
+    """
+    candidates = []
+    try:
+        candidates.append(StringSession.save(client.session))
+    except Exception:
+        pass
+    try:
+        candidates.append(client.session.save())
+    except Exception:
+        pass
+    try:
+        candidates.append(getattr(client.session, 'string', None))
+    except Exception:
+        pass
+
+    for value in candidates:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
 
 def get_profile(owner_id: int) -> ProfileData:
     if owner_id not in profiles:
@@ -479,7 +510,20 @@ async def finish_login_for_account(uid: int, password_used: Optional[str]):
     phone = data["phone"]
     client: TelegramClient = data["client"]
 
-    cfg = AccountConfig(api_id=api_id, api_hash=api_hash, phone=phone, password=password_used)
+    session_string = extract_session_string(client)
+    if not session_string:
+        # Fall back to an empty string instead of NULL so the DB constraint
+        # cannot be violated; this keeps the bot alive and lets the account
+        # stay usable in the current runtime.
+        print(f"WARNING: could not extract session string for {phone}; storing empty string.")
+
+    cfg = AccountConfig(
+        api_id=api_id,
+        api_hash=api_hash,
+        phone=phone,
+        password=password_used,
+        session_string=session_string,
+    )
     profile.accounts.append(cfg)
     profile.user_clients[phone] = client
     profile.client_to_phone[client] = phone
