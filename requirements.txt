@@ -1,3 +1,6 @@
 telethon
 aiohttp
+sqlalchemy
+asyncpg
+greenlet
 psycopg[binary]
