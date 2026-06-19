@@ -5,32 +5,252 @@ import random
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Set
 
+from sqlalchemy import Column, Integer, String, BigInteger, Text, select
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import declarative_base, sessionmaker
+
 from telethon import TelegramClient, events, Button
 from telethon.errors import UserAlreadyParticipantError, SessionPasswordNeededError
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
+from telethon.sessions import StringSession
 
+# ---------- Environment ----------
 API_ID = int(os.environ.get("API_ID", "0"))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 OWNER_ID: int = 6474515118
-
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 if not API_ID or not API_HASH or not BOT_TOKEN:
     raise RuntimeError("API_ID / API_HASH / BOT_TOKEN must be set as environment variables.")
-
 if not DATABASE_URL:
-    print("WARNING: DATABASE_URL not set. DB-related features are disabled for now.")
+    raise RuntimeError("DATABASE_URL must be set for persistent storage.")
 
+# ---------- Database Models ----------
+Base = declarative_base()
 
+class ProfileModel(Base):
+    __tablename__ = "profiles"
+    owner_id = Column(BigInteger, primary_key=True)
+    timer_type = Column(String, default="fixed")
+    timer_value = Column(Integer, default=5)
+
+class AccountModel(Base):
+    __tablename__ = "accounts"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    owner_id = Column(BigInteger, nullable=False)
+    phone = Column(String, nullable=False)
+    api_id = Column(Integer, nullable=False)
+    api_hash = Column(String, nullable=False)
+    password = Column(String, nullable=True)
+    session_string = Column(Text, nullable=False)
+
+class SourceChannelModel(Base):
+    __tablename__ = "source_channels"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    owner_id = Column(BigInteger, nullable=False)
+    channel = Column(String, nullable=False)
+
+class MessageModel(Base):
+    __tablename__ = "messages"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    owner_id = Column(BigInteger, nullable=False)
+    text = Column(Text, nullable=False)
+
+class TargetChatModel(Base):
+    __tablename__ = "target_chats"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    owner_id = Column(BigInteger, nullable=False)
+    phone = Column(String, nullable=False)
+    chat_id = Column(BigInteger, nullable=False)
+
+class SpecialUserModel(Base):
+    __tablename__ = "special_users"
+    user_id = Column(BigInteger, primary_key=True)
+
+# ---------- Database Helpers ----------
+engine = create_async_engine(DATABASE_URL, echo=False)
+AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+async def init_db():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+async def save_profile(owner_id: int, profile_data: 'ProfileData'):
+    async with AsyncSessionLocal() as session:
+        # Profile
+        stmt = select(ProfileModel).where(ProfileModel.owner_id == owner_id)
+        p = (await session.execute(stmt)).scalar_one_or_none()
+        if not p:
+            p = ProfileModel(owner_id=owner_id)
+            session.add(p)
+        p.timer_type = profile_data.timer_type
+        p.timer_value = profile_data.timer_value
+
+        # Accounts
+        await session.execute(AccountModel.__table__.delete().where(AccountModel.owner_id == owner_id))
+        for acc in profile_data.accounts:
+            client = profile_data.user_clients.get(acc.phone)
+            session_str = ""
+            if client:
+                session_str = client.session.save() if hasattr(client.session, 'save') else client.session.string
+            session.add(AccountModel(
+                owner_id=owner_id,
+                phone=acc.phone,
+                api_id=acc.api_id,
+                api_hash=acc.api_hash,
+                password=acc.password,
+                session_string=session_str
+            ))
+
+        # Source channels
+        await session.execute(SourceChannelModel.__table__.delete().where(SourceChannelModel.owner_id == owner_id))
+        for ch in profile_data.source_channels:
+            session.add(SourceChannelModel(owner_id=owner_id, channel=ch))
+
+        # Messages
+        await session.execute(MessageModel.__table__.delete().where(MessageModel.owner_id == owner_id))
+        for msg in profile_data.messages:
+            session.add(MessageModel(owner_id=owner_id, text=msg))
+
+        # Target chats
+        await session.execute(TargetChatModel.__table__.delete().where(TargetChatModel.owner_id == owner_id))
+        for phone, chat_set in profile_data.target_chats.items():
+            for chat_id in chat_set:
+                session.add(TargetChatModel(owner_id=owner_id, phone=phone, chat_id=chat_id))
+
+        await session.commit()
+
+async def load_profile(owner_id: int) -> Optional['ProfileData']:
+    async with AsyncSessionLocal() as session:
+        stmt = select(ProfileModel).where(ProfileModel.owner_id == owner_id)
+        profile = (await session.execute(stmt)).scalar_one_or_none()
+        if not profile:
+            return None
+
+        stmt = select(AccountModel).where(AccountModel.owner_id == owner_id)
+        accounts = (await session.execute(stmt)).scalars().all()
+
+        stmt = select(SourceChannelModel).where(SourceChannelModel.owner_id == owner_id)
+        channels = (await session.execute(stmt)).scalars().all()
+
+        stmt = select(MessageModel).where(MessageModel.owner_id == owner_id)
+        messages = (await session.execute(stmt)).scalars().all()
+
+        stmt = select(TargetChatModel).where(TargetChatModel.owner_id == owner_id)
+        targets = (await session.execute(stmt)).scalars().all()
+
+        # Build ProfileData
+        pd = ProfileData()
+        pd.timer_type = profile.timer_type
+        pd.timer_value = profile.timer_value
+
+        # Accounts
+        for acc_model in accounts:
+            cfg = AccountConfig(
+                api_id=acc_model.api_id,
+                api_hash=acc_model.api_hash,
+                phone=acc_model.phone,
+                password=acc_model.password
+            )
+            pd.accounts.append(cfg)
+
+            # Create client from session string
+            client = TelegramClient(StringSession(acc_model.session_string), cfg.api_id, cfg.api_hash)
+            await client.connect()
+            if not await client.is_user_authorized():
+                print(f"Session invalid for {cfg.phone}, skipping.")
+                continue
+            pd.user_clients[cfg.phone] = client
+            pd.client_to_phone[client] = cfg.phone
+            client_owner[client] = owner_id
+            setup_user_handlers(client, owner_id)
+
+        # Source channels
+        pd.source_channels = [ch.channel for ch in channels]
+        # Messages
+        pd.messages = [msg.text for msg in messages]
+        # Target chats
+        for t in targets:
+            if t.phone not in pd.target_chats:
+                pd.target_chats[t.phone] = set()
+            pd.target_chats[t.phone].add(t.chat_id)
+
+        # Re-join source channels to fill source_channel_ids
+        for client in pd.user_clients.values():
+            for chan_str in pd.source_channels:
+                await join_source_channel(client, chan_str, owner_id)
+
+        return pd
+
+async def load_all_profiles():
+    global SPECIAL_USERS
+    # Load special users
+    async with AsyncSessionLocal() as session:
+        stmt = select(SpecialUserModel)
+        specials = (await session.execute(stmt)).scalars().all()
+        SPECIAL_USERS = {su.user_id for su in specials}
+
+    # Load owner and all specials
+    all_users = {OWNER_ID} | SPECIAL_USERS
+    for uid in all_users:
+        pd = await load_profile(uid)
+        if pd is None:
+            # Create new profile entry
+            async with AsyncSessionLocal() as session:
+                session.add(ProfileModel(owner_id=uid))
+                await session.commit()
+            pd = await load_profile(uid)
+        if pd:
+            profiles[uid] = pd
+
+async def add_target_chat_db(owner_id: int, phone: str, chat_id: int):
+    async with AsyncSessionLocal() as session:
+        stmt = select(TargetChatModel).where(
+            TargetChatModel.owner_id == owner_id,
+            TargetChatModel.phone == phone,
+            TargetChatModel.chat_id == chat_id
+        )
+        exists = (await session.execute(stmt)).scalar_one_or_none()
+        if not exists:
+            session.add(TargetChatModel(owner_id=owner_id, phone=phone, chat_id=chat_id))
+            await session.commit()
+
+async def remove_target_chat_db(owner_id: int, phone: str, chat_id: int):
+    async with AsyncSessionLocal() as session:
+        stmt = select(TargetChatModel).where(
+            TargetChatModel.owner_id == owner_id,
+            TargetChatModel.phone == phone,
+            TargetChatModel.chat_id == chat_id
+        )
+        obj = (await session.execute(stmt)).scalar_one_or_none()
+        if obj:
+            await session.delete(obj)
+            await session.commit()
+
+async def add_special_user_db(user_id: int):
+    async with AsyncSessionLocal() as session:
+        session.add(SpecialUserModel(user_id=user_id))
+        await session.commit()
+    SPECIAL_USERS.add(user_id)
+
+async def remove_special_user_db(user_id: int):
+    async with AsyncSessionLocal() as session:
+        stmt = select(SpecialUserModel).where(SpecialUserModel.user_id == user_id)
+        obj = (await session.execute(stmt)).scalar_one_or_none()
+        if obj:
+            await session.delete(obj)
+            await session.commit()
+    SPECIAL_USERS.discard(user_id)
+
+# ---------- Core Data Structures ----------
 @dataclass
 class AccountConfig:
     api_id: int
     api_hash: str
     phone: str
     password: Optional[str] = None
-
 
 @dataclass
 class ProfileData:
@@ -45,7 +265,6 @@ class ProfileData:
     timer_value: int = 5
     sending_active: bool = False
     send_tasks: List[asyncio.Task] = field(default_factory=list)
-
 
 profiles: Dict[int, ProfileData] = {}
 SPECIAL_USERS: Set[int] = set()
@@ -67,21 +286,17 @@ STATE_WAIT_MESSAGE_REMOVE = "WAIT_MESSAGE_REMOVE"
 STATE_WAIT_TIMER_VALUE = "WAIT_TIMER_VALUE"
 STATE_WAIT_SPECIAL_ADD = "WAIT_SPECIAL_ADD"
 STATE_WAIT_SPECIAL_REMOVE = "WAIT_SPECIAL_REMOVE"
-# وضعیت جدید برای افزودن گروه دستی
 STATE_WAIT_GROUP_ADD = "WAIT_GROUP_ADD"
 
 TELEGRAM_LINK_REGEX = re.compile(r"(https?://t\.me/[^\s]+)")
 
-
 def log(prefix: str, msg: str):
     print(f"[{prefix}] {msg}")
-
 
 def get_profile(owner_id: int) -> ProfileData:
     if owner_id not in profiles:
         profiles[owner_id] = ProfileData()
     return profiles[owner_id]
-
 
 def set_state(user_id: int, state: str):
     if state:
@@ -89,23 +304,19 @@ def set_state(user_id: int, state: str):
     else:
         user_states.pop(user_id, None)
 
-
 def get_state(user_id: int) -> str:
     return user_states.get(user_id, STATE_NONE)
-
 
 def is_owner(user_id: int) -> bool:
     return user_id == OWNER_ID
 
-
 def is_allowed_user(user_id: int) -> bool:
     return user_id == OWNER_ID or user_id in SPECIAL_USERS
-
 
 def check_admin(event) -> bool:
     return is_allowed_user(event.sender_id)
 
-
+# ---------- Core Functions ----------
 def register_target_chat(client: TelegramClient, chat_id: int):
     owner_id = client_owner.get(client)
     if owner_id is None:
@@ -117,8 +328,8 @@ def register_target_chat(client: TelegramClient, chat_id: int):
     if phone not in profile.target_chats:
         profile.target_chats[phone] = set()
     profile.target_chats[phone].add(chat_id)
+    asyncio.create_task(add_target_chat_db(owner_id, phone, chat_id))
     log(f"{owner_id}/{phone}", f"Registered target chat: {chat_id}")
-
 
 async def join_by_link(client: TelegramClient, link: str):
     owner_id = client_owner.get(client)
@@ -163,7 +374,6 @@ async def join_by_link(client: TelegramClient, link: str):
             log(tag, f"Failed to get entity for already-participant: {e2}")
     except Exception as e:
         log(tag, f"Failed to join public link: {e}")
-
 
 async def join_source_channel(client: TelegramClient, chan_str: str, owner_id: int):
     profile = get_profile(owner_id)
@@ -218,7 +428,6 @@ async def join_source_channel(client: TelegramClient, chan_str: str, owner_id: i
         log(tag, f"Failed to join source channel {chan_str}: {e}")
         return None
 
-
 async def check_last_messages_for_all_channels(client: TelegramClient, owner_id: int):
     profile = get_profile(owner_id)
     me = await client.get_me()
@@ -239,7 +448,6 @@ async def check_last_messages_for_all_channels(client: TelegramClient, owner_id:
         except Exception as e:
             log(tag, f"Error reading last message of {cid}: {e}")
 
-
 def setup_user_handlers(client: TelegramClient, owner_id: int):
     profile = get_profile(owner_id)
 
@@ -256,7 +464,6 @@ def setup_user_handlers(client: TelegramClient, owner_id: int):
         log(tag, f"New message in source {event.chat_id} has links: {links}")
         for link in links:
             await join_by_link(client, link)
-
 
 async def finish_login_for_account(uid: int, password_used: Optional[str]):
     data = pending_account.get(uid)
@@ -283,7 +490,7 @@ async def finish_login_for_account(uid: int, password_used: Optional[str]):
 
     pending_account.pop(uid, None)
     set_state(uid, STATE_NONE)
-
+    await save_profile(uid, profile)
 
 async def add_source_channel_from_text(owner_id: int, text: str):
     profile = get_profile(owner_id)
@@ -295,42 +502,39 @@ async def add_source_channel_from_text(owner_id: int, text: str):
 
     for client in profile.user_clients.values():
         await check_last_messages_for_all_channels(client, owner_id)
-
+    await save_profile(owner_id, profile)
 
 async def remove_source_channel_by_index(owner_id: int, idx: int):
     profile = get_profile(owner_id)
     if idx < 1 or idx > len(profile.source_channels):
         raise IndexError("ایندکس نامعتبر است.")
-
     removed = profile.source_channels.pop(idx - 1)
     log(f"SYSTEM/{owner_id}", f"Source channel removed: {removed}")
-
     profile.source_channel_ids.clear()
     for client in profile.user_clients.values():
         for chan_str in profile.source_channels:
             await join_source_channel(client, chan_str, owner_id)
-
+    await save_profile(owner_id, profile)
 
 async def remove_account_by_index(owner_id: int, idx: int):
     profile = get_profile(owner_id)
     if idx < 1 or idx > len(profile.accounts):
         raise IndexError("ایندکس نامعتبر است.")
-
     cfg = profile.accounts.pop(idx - 1)
     client = profile.user_clients.pop(cfg.phone, None)
     if client is not None:
         profile.client_to_phone.pop(client, None)
         client_owner.pop(client, None)
         await client.disconnect()
+        if cfg.phone in profile.target_chats:
+            del profile.target_chats[cfg.phone]
         log(f"SYSTEM/{owner_id}", f"Account {cfg.phone} disconnected & removed.")
+    await save_profile(owner_id, profile)
 
-
-# تابع جدید برای افزودن گروه دستی به تمام اکانت‌ها
 async def add_manual_group(owner_id: int, link: str):
     profile = get_profile(owner_id)
     if not profile.user_clients:
         raise Exception("هیچ اکانتی لاگین نشده است.")
-
     success_count = 0
     for client in profile.user_clients.values():
         try:
@@ -338,8 +542,8 @@ async def add_manual_group(owner_id: int, link: str):
             success_count += 1
         except Exception as e:
             log(f"{owner_id}", f"Error joining group for one client: {e}")
+    await save_profile(owner_id, profile)
     return success_count
-
 
 async def send_loop_for_client(client: TelegramClient, phone: str, owner_id: int):
     profile = get_profile(owner_id)
@@ -389,7 +593,6 @@ async def send_loop_for_client(client: TelegramClient, phone: str, owner_id: int
             except Exception as e:
                 log(tag, f"Failed to send scheduled message to {chat_id}: {e}")
 
-
 async def start_sending_process(event):
     owner_id = event.sender_id
     profile = get_profile(owner_id)
@@ -429,7 +632,6 @@ async def start_sending_process(event):
         buttons=sending_menu_buttons(is_owner(owner_id))
     )
 
-
 async def stop_sending_process(event):
     owner_id = event.sender_id
     profile = get_profile(owner_id)
@@ -447,9 +649,8 @@ async def stop_sending_process(event):
     await event.edit("⏹ همه‌ی فرآیندهای ارسال پیام متوقف شدند.",
                      buttons=sending_menu_buttons(is_owner(owner_id)))
 
-
+# ---------- Bot Menus ----------
 bot_client = TelegramClient("bot_session", API_ID, API_HASH)
-
 
 def main_menu_buttons(owner: bool):
     rows = [
@@ -458,13 +659,11 @@ def main_menu_buttons(owner: bool):
         [Button.inline("💬 مدیریت پیام‌ها", b"menu_messages")],
         [Button.inline("⏱ تنظیم تایمر", b"menu_timer")],
         [Button.inline("🚀 کنترل ارسال پیام‌ها", b"menu_sending")],
-        # دکمه جدید برای افزودن گروه دستی
         [Button.inline("➕ افزودن گروه دستی", b"group_add")],
     ]
     if owner:
         rows.append([Button.inline("👑 مدیریت کاربران ویژه", b"menu_special")])
     return rows
-
 
 def accounts_menu_buttons():
     return [
@@ -474,7 +673,6 @@ def accounts_menu_buttons():
         [Button.inline("⬅️ بازگشت", b"back_main")],
     ]
 
-
 def channels_menu_buttons():
     return [
         [Button.inline("➕ افزودن کانال منبع", b"chan_add")],
@@ -483,7 +681,6 @@ def channels_menu_buttons():
         [Button.inline("⬅️ بازگشت", b"back_main")],
     ]
 
-
 def messages_menu_buttons():
     return [
         [Button.inline("➕ افزودن پیام", b"msg_add")],
@@ -491,7 +688,6 @@ def messages_menu_buttons():
         [Button.inline("🗑 حذف پیام", b"msg_remove")],
         [Button.inline("⬅️ بازگشت", b"back_main")],
     ]
-
 
 def timer_menu_buttons():
     return [
@@ -503,14 +699,12 @@ def timer_menu_buttons():
         [Button.inline("⬅️ بازگشت", b"back_main")],
     ]
 
-
 def sending_menu_buttons(owner: bool):
     return [
         [Button.inline("▶️ شروع ارسال", b"send_start")],
         [Button.inline("⏹ توقف ارسال", b"send_stop")],
         [Button.inline("⬅️ بازگشت", b"back_main")],
     ]
-
 
 def special_menu_buttons():
     return [
@@ -519,21 +713,30 @@ def special_menu_buttons():
         [Button.inline("⬅️ بازگشت", b"back_main")],
     ]
 
-
+# ---------- Bot Handlers ----------
 @bot_client.on(events.NewMessage(pattern="/start"))
 async def bot_start(event: events.NewMessage.Event):
     uid = event.sender_id
     if not check_admin(event):
         return
+    # Ensure profile is loaded
+    if uid not in profiles:
+        pd = await load_profile(uid)
+        if pd is None:
+            # Create new profile entry
+            async with AsyncSessionLocal() as session:
+                session.add(ProfileModel(owner_id=uid))
+                await session.commit()
+            pd = await load_profile(uid)
+        if pd:
+            profiles[uid] = pd
+        else:
+            # Fallback
+            profiles[uid] = ProfileData()
     get_profile(uid)
     set_state(uid, STATE_NONE)
-    text = (
-        "سلام 👋\n"
-        "به پنل مدیریت خوش اومدی.\n\n"
-        "یکی از گزینه‌های زیر رو انتخاب کن:"
-    )
+    text = "سلام 👋\nبه پنل مدیریت خوش اومدی.\n\nیکی از گزینه‌های زیر رو انتخاب کن:"
     await event.respond(text, buttons=main_menu_buttons(is_owner(uid)))
-
 
 @bot_client.on(events.CallbackQuery)
 async def bot_callback(event: events.CallbackQuery.Event):
@@ -570,10 +773,7 @@ async def bot_callback(event: events.CallbackQuery.Event):
     if data == "acc_add":
         pending_account[uid] = {}
         set_state(uid, STATE_ACC_API_ID)
-        txt = (
-            "➕ افزودن اکانت جدید:\n\n"
-            "اول `api_id` رو بفرست."
-        )
+        txt = "➕ افزودن اکانت جدید:\n\nاول `api_id` رو بفرست."
         await event.edit(txt, buttons=accounts_menu_buttons(), parse_mode="Markdown")
         return
 
@@ -678,6 +878,7 @@ async def bot_callback(event: events.CallbackQuery.Event):
 
     if data == "timer_fixed":
         profile.timer_type = "fixed"
+        await save_profile(uid, profile)
         await event.edit(
             f"نوع تایمر روی fixed تنظیم شد.\nفاصله فعلی: {profile.timer_value} دقیقه",
             buttons=timer_menu_buttons()
@@ -686,6 +887,7 @@ async def bot_callback(event: events.CallbackQuery.Event):
 
     if data == "timer_random":
         profile.timer_type = "random"
+        await save_profile(uid, profile)
         await event.edit(
             "نوع تایمر روی random تنظیم شد.\n"
             "فاصله‌ی هر یوزر به صورت رندوم بین 15 و 500 دقیقه انتخاب می‌شود.",
@@ -705,7 +907,6 @@ async def bot_callback(event: events.CallbackQuery.Event):
         await stop_sending_process(event)
         return
 
-    # افزودن گروه دستی
     if data == "group_add":
         set_state(uid, STATE_WAIT_GROUP_ADD)
         await event.edit(
@@ -751,14 +952,11 @@ async def bot_callback(event: events.CallbackQuery.Event):
             await event.edit("هیچ کاربر ویژه‌ای برای حذف وجود ندارد.", buttons=special_menu_buttons())
             return
         set_state(uid, STATE_WAIT_SPECIAL_REMOVE)
-        lines = [
-            "🗑 حذف کاربر ویژه:\nuser_id یکی از کاربران زیر را بفرست:",
-        ]
+        lines = ["🗑 حذف کاربر ویژه:\nuser_id یکی از کاربران زیر را بفرست:"]
         for uid2 in SPECIAL_USERS:
             lines.append(f"- {uid2}")
         await event.edit("\n".join(lines), buttons=special_menu_buttons())
         return
-
 
 @bot_client.on(events.NewMessage)
 async def bot_text_handler(event: events.NewMessage.Event):
@@ -893,6 +1091,7 @@ async def bot_text_handler(event: events.NewMessage.Event):
     if state == STATE_WAIT_MESSAGE_ADD:
         profile.messages.append(text)
         set_state(uid, STATE_NONE)
+        await save_profile(uid, profile)
         await event.respond("✅ پیام به لیست اضافه شد.")
         await event.respond("💬 برگردیم به منوی پیام‌ها:", buttons=messages_menu_buttons())
         return
@@ -904,6 +1103,7 @@ async def bot_text_handler(event: events.NewMessage.Event):
                 raise IndexError("ایندکس نامعتبر است.")
             removed = profile.messages.pop(idx - 1)
             set_state(uid, STATE_NONE)
+            await save_profile(uid, profile)
             await event.respond(f"✅ پیام حذف شد:\n{removed}")
             await event.respond("💬 برگردیم به منوی پیام‌ها:", buttons=messages_menu_buttons())
         except Exception as e:
@@ -917,13 +1117,13 @@ async def bot_text_handler(event: events.NewMessage.Event):
                 raise ValueError
             profile.timer_value = val
             set_state(uid, STATE_NONE)
+            await save_profile(uid, profile)
             await event.respond(f"⏱ فاصله‌ی fixed روی {profile.timer_value} دقیقه تنظیم شد.")
             await event.respond("منوی تایمر:", buttons=timer_menu_buttons())
         except Exception:
             await event.respond("عدد معتبر (دقیقه مثبت) وارد کن.")
         return
 
-    # مدیریت افزودن گروه دستی
     if state == STATE_WAIT_GROUP_ADD:
         try:
             count = await add_manual_group(uid, text)
@@ -940,8 +1140,17 @@ async def bot_text_handler(event: events.NewMessage.Event):
     if state == STATE_WAIT_SPECIAL_ADD and is_owner(uid):
         try:
             special_id = int(text)
-            SPECIAL_USERS.add(special_id)
-            get_profile(special_id)
+            await add_special_user_db(special_id)
+            # Load profile for the new special user (if not exists)
+            if special_id not in profiles:
+                pd = await load_profile(special_id)
+                if pd is None:
+                    async with AsyncSessionLocal() as session:
+                        session.add(ProfileModel(owner_id=special_id))
+                        await session.commit()
+                    pd = await load_profile(special_id)
+                if pd:
+                    profiles[special_id] = pd
             set_state(uid, STATE_NONE)
             await event.respond(
                 f"✅ کاربر ویژه اضافه شد: {special_id}\n"
@@ -956,7 +1165,8 @@ async def bot_text_handler(event: events.NewMessage.Event):
         try:
             special_id = int(text)
             if special_id in SPECIAL_USERS:
-                SPECIAL_USERS.remove(special_id)
+                await remove_special_user_db(special_id)
+                # Remove from profiles and disconnect clients
                 prof = profiles.pop(special_id, None)
                 if prof:
                     for c in prof.user_clients.values():
@@ -975,8 +1185,13 @@ async def bot_text_handler(event: events.NewMessage.Event):
             await event.respond(f"❌ خطا در حذف کاربر ویژه:\n{e}")
         return
 
-
+# ---------- Main ----------
 async def run_bot():
+    await init_db()
+    await load_all_profiles()
     await bot_client.start(bot_token=BOT_TOKEN)
     print("Management bot started. Use /start in Telegram with admin/special accounts.")
     await bot_client.run_until_disconnected()
+
+if __name__ == "__main__":
+    asyncio.run(run_bot())
