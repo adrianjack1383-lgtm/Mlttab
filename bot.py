@@ -70,7 +70,11 @@ class SpecialUserModel(Base):
     user_id = Column(BigInteger, primary_key=True)
 
 # ---------- Database Helpers ----------
-engine = create_async_engine(DATABASE_URL, echo=False)
+engine = create_async_engine(
+    DATABASE_URL,
+    echo=False,
+    connect_args={"ssl": "require"},
+)
 AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 async def init_db():
